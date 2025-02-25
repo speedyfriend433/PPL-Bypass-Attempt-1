@@ -3,13 +3,14 @@
 #include "oob_timestamp/mach_vm.h"
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach/mach.h>
 
 typedef struct {
-    uint64_t next;
-    uint64_t prev;
-    uint64_t start;
-    uint64_t end;
-} kernel_map_entry;
+    uint64_t magic;
+    uint64_t flags;
+    uint64_t address;
+    uint64_t size;
+} iosurface_map_entry;
 
 static uint64_t kernel_slide = 0;
 static uint64_t kernel_base = 0;
@@ -23,51 +24,44 @@ uint64_t kernel_get_base(void) {
 }
 
 kern_return_t kernel_slide_init(void) {
-    uint32_t image_count = _dyld_image_count();
-    for (uint32_t i = 0; i < image_count; i++) {
-        const struct mach_header* header = (const struct mach_header*)_dyld_get_image_header(i);
-        if (header->filetype == MH_EXECUTE) {
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-            mach_vm_address_t base = (mach_vm_address_t)header + slide;
-            vm_address_t* possible_kernel_ptr = (vm_address_t*)base;
-            for (int j = 0; j < 1024; j++) {
-                if ((possible_kernel_ptr[j] & 0xFFFFFFF000000000) == 0xFFFFFFF000000000) {
-                    kernel_base = possible_kernel_ptr[j] & ~0xFFF;
-                    kernel_slide = kernel_base - 0xFFFFFFF007004000;
-                    return KERN_SUCCESS;
+    mach_port_t self_task = mach_task_self();
+    vm_address_t scan_addr = 0x100000000;
+    vm_size_t scan_size = 0x100000000;
+    
+    while (scan_addr < 0x200000000) {
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_vm_size_t size;
+        mach_port_t object_name;
+        vm_address_t address = scan_addr;
+        
+        kern_return_t kr = vm_region_64(self_task,
+                                      &address,
+                                      &size,
+                                      VM_REGION_BASIC_INFO_64,
+                                      (vm_region_info_t)&info,
+                                      &count,
+                                      &object_name);
+        
+        if (kr != KERN_SUCCESS) break;
+        if ((info.protection & VM_PROT_READ) &&
+            (info.protection & VM_PROT_WRITE)) {
+            for (vm_address_t ptr = address;
+                 ptr < (address + size - sizeof(uint64_t));
+                 ptr += sizeof(uint64_t)) {
+                uint64_t value;
+                if (vm_read_overwrite(self_task, ptr, sizeof(uint64_t),
+                                    (vm_address_t)&value, &size) == KERN_SUCCESS) {
+                    if ((value & 0xFFFFFFF000000000) == 0xFFFFFFF000000000) {
+                        kernel_base = value & ~0xFFF;
+                        kernel_slide = kernel_base - 0xFFFFFFF007004000;
+                        return KERN_SUCCESS;
+                    }
                 }
             }
         }
-    }
-    
-    mach_port_t kernel_task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), 0, &kernel_task);
-    if (kr != KERN_SUCCESS) {
-        return kr;
-    }
-    
-    mach_vm_address_t address = 0xFFFFFFF000000000;
-    while (address < 0xFFFFFFF100000000) {
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_vm_size_t size;
-        mach_port_t object_name;
         
-        kr = mach_vm_region_recurse(kernel_task,
-                           &address,
-                           &size,
-                           VM_REGION_BASIC_INFO_64,
-                           (vm_region_info_t)&info,
-                           &info_count);
-                           
-        if (kr == KERN_SUCCESS && (info.protection & VM_PROT_READ)) {
-            kernel_base = address;
-            kernel_slide = kernel_base - 0xFFFFFFF007004000; // make it dynamically
-            return KERN_SUCCESS;
-        }
-        
-        if (kr != KERN_SUCCESS) break;
-        address += size;
+        scan_addr = address + size;
     }
     
     return KERN_FAILURE;
